@@ -68,6 +68,10 @@ struct _DRIVE_DEVICE
 	rdpContext* rdpcontext;
 };
 
+#ifdef WITH_MS_LABEL
+static wHashTable* char_table = NULL;
+#endif
+
 static UINT32 drive_map_posix_err(int fs_errno)
 {
 	UINT32 rc;
@@ -816,7 +820,11 @@ UINT drive_register_drive_path(PDEVICE_SERVICE_ENTRY_POINTS pEntryPoints, char* 
 		}
 
 		for (i = 0; i <= length; i++)
-			Stream_Write_UINT8(drive->device.data, name[i] < 0 ? '_' : name[i]);
+		#ifdef WITH_MS_LABEL
+			Stream_Write_UINT8(drive->device.data, name[i] < 0 ? (char_table ? HashTable_GetItemValue(char_table, name[i]) : '_') : name[i]);
+		#else
+ 			Stream_Write_UINT8(drive->device.data, name[i] < 0 ? '_' : name[i]);
+		#endif
 
 		drive->path = path;
 
@@ -882,6 +890,23 @@ UINT DeviceServiceEntry(PDEVICE_SERVICE_ENTRY_POINTS pEntryPoints)
 	char devlist[512], buf[512];
 	char *bufdup;
 	char *devdup;
+#endif
+
+#ifdef WITH_MS_LABEL
+	if (!char_table) {	
+		char_table = HashTable_New(TRUE);
+
+		HashTable_Add(char_table, -73, 192); 
+		HashTable_Add(char_table, -74, 194); 
+		HashTable_Add(char_table, -128, 199);
+		HashTable_Add(char_table, -44, 200); 
+		HashTable_Add(char_table, -112, 201);
+		HashTable_Add(char_table, -46, 202); 
+		HashTable_Add(char_table, -45, 203); 
+		HashTable_Add(char_table, -91, 209); 
+		HashTable_Add(char_table, -21, 217); 
+		HashTable_Add(char_table, -22, 219); 
+	}
 #endif
 
 	drive = (RDPDR_DRIVE*) pEntryPoints->device;
