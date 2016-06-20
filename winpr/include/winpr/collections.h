@@ -274,6 +274,8 @@ struct _wKeyValuePair
 	wKeyValuePair* next;
 };
 
+WINPR_API wKeyValuePair* KeyValuePair_New(void* key, void* value);
+
 /* Reference Table */
 
 struct _wReference
