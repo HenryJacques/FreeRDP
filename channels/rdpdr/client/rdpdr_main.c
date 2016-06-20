@@ -585,6 +585,10 @@ static UINT drive_hotplug_thread_terminate(rdpdrPlugin* rdpdr)
 #define MAX_USB_DEVICES 100
 
 typedef struct _hotplug_dev {
+#ifdef WITH_MS_LABEL
+	char* devname;
+	char* name;
++#endif /* WITH_MS_LABEL */
 	char* path;
 	BOOL  to_add;
 } hotplug_dev;
@@ -676,6 +680,81 @@ static char* get_word(char* str, unsigned int* offset)
 	return word;
 }
 
+#ifdef WITH_MS_LABEL
+
+#include <blkid/blkid.h>
+#include <winpr/library.h>
+
+static wLinkedList* devices_list = NULL;
+static HMODULE g_blkidModule = NULL;
+
+struct _blkidFunctionTable
+{
+	int 			(*pblkid_get_cache)(blkid_cache *cache, const char *filename);
+	blkid_dev 		(*pblkid_get_dev)(blkid_cache cache, const char *devname, int flags);
+	const char * 		(*pblkid_dev_devname)(blkid_dev dev);
+	blkid_tag_iterate 	(*pblkid_tag_iterate_begin)(blkid_dev dev);
+	int 			(*pblkid_tag_next)(blkid_tag_iterate iterate, const char **type, const char **value);
+	void 			(*pblkid_tag_iterate_end)(blkid_tag_iterate iterate);
+	void 			(*pblkid_put_cache)(blkid_cache cache);
+};
+typedef struct _blkidFunctionTable blkidFunctionTable;
+
+static blkidFunctionTable g_blkid = {0};
+
+static BOOL get_msdos_label(char* devname, char** name)
+{
+	BOOL label_found = FALSE;
+	
+	g_blkidModule = LoadLibrary("libblkid.so.1");
+	
+	if (!g_blkidModule) {
+		g_blkidModule = LoadLibrary("libblkid.so");
+	}
+	
+	if (!g_blkidModule) {
+		WLog_ERR(TAG, "Failed to load blkid module");
+	}
+
+	g_blkid.pblkid_get_cache 		= (void*) GetProcAddress(g_blkidModule, "blkid_get_cache");
+	g_blkid.pblkid_get_dev 			= (void*) GetProcAddress(g_blkidModule, "blkid_get_dev");
+	g_blkid.pblkid_dev_devname 		= (void*) GetProcAddress(g_blkidModule, "blkid_dev_devname");
+	g_blkid.pblkid_tag_iterate_begin 	= (void*) GetProcAddress(g_blkidModule, "blkid_tag_iterate_begin");
+	g_blkid.pblkid_tag_next 		= (void*) GetProcAddress(g_blkidModule, "blkid_tag_next");
+	g_blkid.pblkid_tag_iterate_end 		= (void*) GetProcAddress(g_blkidModule, "blkid_tag_iterate_end");
+	g_blkid.pblkid_put_cache 		= (void*) GetProcAddress(g_blkidModule, "blkid_put_cache");
+
+	blkid_cache cache = NULL;
+	if (g_blkid.pblkid_get_cache(&cache, NULL) < 0) {
+		WLog_ERR(TAG, "Failed to get cache");
+		goto exit;
+	}
+
+	blkid_dev dev = g_blkid.pblkid_get_dev(cache, devname, BLKID_DEV_NORMAL);
+
+	if (dev) {
+		blkid_tag_iterate	iter;
+		const char		*type, *value, *devname;
+
+		devname = g_blkid.pblkid_dev_devname(dev);
+		iter = g_blkid.pblkid_tag_iterate_begin(dev);
+		while (g_blkid.pblkid_tag_next(iter, &type, &value) == 0) {
+			if (strstr(type, "LABEL") != NULL) {
+				*name = (char*) malloc(strlen(value));
+				strcpy(*name, value);
+				label_found = TRUE;
+			}
+		}
+		g_blkid.pblkid_tag_iterate_end(iter);
+	}	
+
+	return label_found;
+exit:
+	g_blkid.pblkid_put_cache(cache);
+	return FALSE;
+}
++#endif /* WITH_MS_LABEL */
+
 /**
  * Function description
  *
@@ -698,6 +777,12 @@ static UINT handle_hotplug(rdpdrPlugin* rdpdr)
 	ULONG_PTR *keys;
 	UINT32 ids[1];
 	UINT error = 0;
+#ifdef WITH_MS_LABEL
+	BOOL dev_found = FALSE;
+ 
+	if (!devices_list)
+		devices_list = LinkedList_New();
+#endif /* WITH_MS_LABEL */
 
 	memset(dev_array, 0, sizeof(dev_array));
 
@@ -713,10 +798,72 @@ static UINT handle_hotplug(rdpdrPlugin* rdpdr)
 		wlen = 0;
 		while ((word = get_word(line, &wlen)))
 		{
+#ifdef WITH_MS_LABEL
+			if (strstr(word, "/dev/") != NULL)
+			{
+				dev_array[size].devname = (char*) malloc(strlen(word));
+				strcpy(dev_array[size].devname, word);
+				dev_found = TRUE;
+				continue;
+			}
+#endif /* WITH_MS_LABEL */
 			/* copy hotpluged device mount point to the dev_array */
 			if (strstr(word, "/mnt/") != NULL || strstr(word, "/media/") != NULL)
 			{
 				dev_array[size].path = word;
+#ifdef WITH_MS_LABEL
+				if (!get_msdos_label(dev_array[size].devname, &dev_array[size].name) || !dev_array[size].name)
+					dev_array[size].name = strrchr(dev_array[size].path, '/') + 1;
+					
+				int cur_index = 1;
+				BOOL dev_found = FALSE;
+				BOOL add_dev = TRUE;
+
+				if (devices_list->count > 0) {
+					wLinkedListNode *p;
+
+					char *name_save;
+					name_save = malloc(strlen(dev_array[size].name)*sizeof(char));
+					strcpy(name_save, dev_array[size].name);
+					search_again:
+					p = devices_list->head;
+
+					while (p) {
+						wKeyValuePair* tmp = (wKeyValuePair*) p->value;
+
+						if (!strcmp(dev_array[size].path, (char*) (tmp->value)))
+						{
+							add_dev = FALSE;
+							dev_found = FALSE;
+							break;
+						}					
+						else if (!strcmp(dev_array[size].name, (char*) (tmp->key)) && strcmp(dev_array[size].path, (char*) (tmp->value)))			
+						{
+							dev_found = TRUE;
+							break;
+						}
+						else {
+							dev_found = FALSE;
+							add_dev = TRUE;
+						}
+						p = p->next;
+					}
+					if (dev_found) {
+						char* tmp_name = NULL;
+						int len = strlen(dev_array[size].name);
+						tmp_name = (char*) realloc(dev_array[size].name, (len + 2) * sizeof(char*));
+						if (tmp_name != NULL) {
+							dev_array[size].name = tmp_name;
+							sprintf(dev_array[size].name, "%s_%d", name_save, cur_index++);
+						}
+						goto search_again;
+					}
+				}
+				if (add_dev) {
+					wKeyValuePair* element = KeyValuePair_New(dev_array[size].name, dev_array[size].path);
+					LinkedList_AddLast(devices_list, element);
+				}
+#endif /* WITH_MS_LABEL */
 				dev_array[size++].to_add = TRUE;
 			}
 			else
@@ -744,7 +891,7 @@ static UINT handle_hotplug(rdpdrPlugin* rdpdr)
 
 		for (i = 0; i < size; i++)
 		{
-			if (strstr(device_ext->path, dev_array[i].path) != NULL)
+			if (!strcmp(device_ext->path, dev_array[i].path))
 			{
 				dev_found = TRUE;
 				dev_array[i].to_add = FALSE;
@@ -771,8 +918,6 @@ static UINT handle_hotplug(rdpdrPlugin* rdpdr)
 
 		if (dev_array[i].to_add)
 		{
-			char* name;
-
 			drive = (RDPDR_DRIVE*) calloc(1, sizeof(RDPDR_DRIVE));
 			if (!drive)
 			{
@@ -785,9 +930,14 @@ static UINT handle_hotplug(rdpdrPlugin* rdpdr)
 
 			drive->Path = dev_array[i].path;
 			dev_array[i].path = NULL;
+#ifdef WITH_MS_LABEL
+			drive->Name = dev_array[i].name;
+#else
+			char* name;
 
 			name = strrchr(drive->Path, '/') + 1;
 			drive->Name = _strdup(name);
+#endif /* WITH_MS_LABEL */
 			if (!drive->Name)
 			{
 				WLog_ERR(TAG, "_strdup failed!");
